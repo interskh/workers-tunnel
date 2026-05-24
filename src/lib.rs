@@ -101,6 +101,13 @@ mod proxy {
     const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
     const DNS_TIMEOUT: Duration = Duration::from_secs(10);
 
+    fn is_retryable(err: &Error) -> bool {
+        matches!(
+            err.kind(),
+            ErrorKind::ConnectionRefused | ErrorKind::TimedOut | ErrorKind::ConnectionAborted
+        )
+    }
+
     struct TunnelRequest {
         network_type: u8,
         remote_port: u16,
@@ -170,7 +177,7 @@ mod proxy {
                         .await
                     {
                         Ok(_) => return Ok(()),
-                        Err(e) if e.kind() == ErrorKind::ConnectionRefused => {
+                        Err(e) if is_retryable(&e) => {
                             last_error = Some(e);
                             continue;
                         }
@@ -411,6 +418,37 @@ mod proxy {
             client_socket.write_u16(data.len() as u16).await?;
             client_socket.write_all(&data).await?;
             client_socket.flush().await?;
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::is_retryable;
+        use std::io::{Error, ErrorKind};
+
+        #[test]
+        fn retries_connection_refused() {
+            assert!(is_retryable(&Error::new(ErrorKind::ConnectionRefused, "")));
+        }
+
+        #[test]
+        fn retries_timed_out() {
+            assert!(is_retryable(&Error::new(ErrorKind::TimedOut, "")));
+        }
+
+        #[test]
+        fn retries_connection_aborted() {
+            assert!(is_retryable(&Error::new(ErrorKind::ConnectionAborted, "")));
+        }
+
+        #[test]
+        fn does_not_retry_invalid_data() {
+            assert!(!is_retryable(&Error::new(ErrorKind::InvalidData, "")));
+        }
+
+        #[test]
+        fn does_not_retry_broken_pipe() {
+            assert!(!is_retryable(&Error::new(ErrorKind::BrokenPipe, "")));
         }
     }
 }
