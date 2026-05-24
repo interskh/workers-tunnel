@@ -1,0 +1,19 @@
+# Copy to `wrangler.toml` and fill in values before deploying.
+# The live wrangler.toml is gitignored so secrets stay local.
+
+name = "workers-tunnel"
+main = "build/worker/shim.mjs"
+compatibility_date = "2024-09-02"
+
+[build]
+command = "cargo install -q worker-build && worker-build --release"
+
+[observability]
+enabled = true
+head_sampling_rate = 1
+
+[vars]
+USER_ID = "00000000-0000-0000-0000-000000000000" # uuidgen | tr '[:upper:]' '[:lower:]'
+PROXY_IP = "" # space-separated relay endpoints; empty if only non-CF destinations
+FALLBACK_SITE = "" # served for non-WS probes, e.g. https://httpbin.org/status/404
+SHOW_URI = "true" # GET /{USER_ID} returns vless:// URI
