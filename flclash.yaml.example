@@ -1,0 +1,95 @@
+# Copy to a local file (e.g. claudedocs/flclash.yaml), fill in <your-domain>
+# and <your-uuid>, then import into FlClash via Profile -> URL/File.
+# Designed for VLESS-WS-TLS over a Cloudflare Worker on a custom domain.
+
+mode: rule
+log-level: info
+ipv6: false
+allow-lan: false
+
+tun:
+  enable: true
+  stack: system
+  auto-route: true
+  auto-detect-interface: true
+  dns-hijack:
+    - any:53
+    - tcp://any:53
+
+dns:
+  enable: true
+  listen: 0.0.0.0:1053
+  ipv6: false
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  fake-ip-filter:
+    - "+.<your-domain-apex>"   # e.g. +.example.com so proxy hostname stays real
+    - "+.lan"
+    - "localhost"
+    - "rfc1918.cidr"
+  default-nameserver:
+    - 223.5.5.5
+    - 119.29.29.29
+  nameserver:
+    - https://dns.alidns.com/dns-query
+    - https://doh.pub/dns-query
+  proxy-server-nameserver:
+    - https://dns.alidns.com/dns-query
+    - https://doh.pub/dns-query
+  fallback:
+    - https://1.1.1.1/dns-query
+    - tls://8.8.4.4:853
+  fallback-filter:
+    geoip: true
+    geoip-code: CN
+
+proxies:
+  - name: workers-tunnel
+    type: vless
+    server: <your-domain>          # e.g. vv.example.com
+    port: 443
+    uuid: <your-uuid>              # USER_ID from wrangler.toml
+    network: ws
+    tls: true
+    udp: false
+    servername: <your-domain>
+    client-fingerprint: chrome
+    ws-opts:
+      path: "/?ed=2560"
+      headers:
+        Host: <your-domain>
+
+proxy-groups:
+  - name: PROXY
+    type: select
+    proxies:
+      - workers-tunnel
+      - DIRECT
+
+rules:
+  - DOMAIN-SUFFIX,baidu.com,DIRECT
+  - DOMAIN-SUFFIX,bilibili.com,DIRECT
+  - DOMAIN-SUFFIX,qq.com,DIRECT
+  - DOMAIN-SUFFIX,weixin.com,DIRECT
+  - DOMAIN-SUFFIX,wechat.com,DIRECT
+  - DOMAIN-SUFFIX,taobao.com,DIRECT
+  - DOMAIN-SUFFIX,tmall.com,DIRECT
+  - DOMAIN-SUFFIX,jd.com,DIRECT
+  - DOMAIN-SUFFIX,alipay.com,DIRECT
+  # CF-anycast destinations the worker can't reach until PROXY_IP relay is deployed
+  - DOMAIN-SUFFIX,google.com,DIRECT
+  - DOMAIN-SUFFIX,googleapis.com,DIRECT
+  - DOMAIN-SUFFIX,gstatic.com,DIRECT
+  - DOMAIN-SUFFIX,youtube.com,DIRECT
+  - DOMAIN-SUFFIX,openai.com,DIRECT
+  - DOMAIN-SUFFIX,chatgpt.com,DIRECT
+  - DOMAIN-SUFFIX,anthropic.com,DIRECT
+  - DOMAIN-SUFFIX,claude.ai,DIRECT
+  - DOMAIN-SUFFIX,github.com,DIRECT
+  - DOMAIN-SUFFIX,githubusercontent.com,DIRECT
+  - DOMAIN-SUFFIX,discord.com,DIRECT
+  - DOMAIN-SUFFIX,cloudflare.com,DIRECT
+  # Don't proxy traffic to the worker hostname itself
+  - DOMAIN-SUFFIX,<your-domain-apex>,DIRECT   # e.g. example.com
+  - GEOIP,CN,DIRECT,no-resolve
+  - MATCH,PROXY
