@@ -244,6 +244,8 @@ mod proxy {
         // process outbound
         match request.network_type {
             protocol::NETWORK_TYPE_TCP => {
+                // Fast path: known CF-fronted domain → SOCKS5 directly,
+                // skipping the doomed direct attempt.
                 if let Some(cfg) = socks5 {
                     if matches_socks5_whitelist(&request.remote_addr, socks5_domains) {
                         return process_socks5_outbound(
@@ -256,26 +258,61 @@ mod proxy {
                     }
                 }
 
-                let mut last_error = None;
-
-                for target in std::iter::once(request.remote_addr.as_str())
-                    .chain(proxy_ip.iter().map(|s| s.as_str()))
+                // Step 1: try direct to the requested target.
+                let mut last_error = match process_tcp_outbound(
+                    &mut client_socket,
+                    &request.remote_addr,
+                    request.remote_port,
+                )
+                .await
                 {
-                    match process_tcp_outbound(&mut client_socket, target, request.remote_port)
-                        .await
+                    Ok(_) => return Ok(()),
+                    Err(e) if is_retryable(&e) => e,
+                    Err(e) => return Err(e),
+                };
+
+                // Step 2: SOCKS5 auto-fallback. Catches CF-blackholed targets
+                // that weren't pre-whitelisted. Logged so the operator can
+                // promote frequently-failing domains into SOCKS5_DOMAINS.
+                if let Some(cfg) = socks5 {
+                    console_log!(
+                        "[SOCKS5-AUTO-FALLBACK] {}:{} — direct refused, using SOCKS5",
+                        request.remote_addr,
+                        request.remote_port
+                    );
+                    match process_socks5_outbound(
+                        &mut client_socket,
+                        cfg,
+                        &request.remote_addr,
+                        request.remote_port,
+                    )
+                    .await
+                    {
+                        Ok(_) => return Ok(()),
+                        Err(e) if is_retryable(&e) => last_error = e,
+                        Err(e) => return Err(e),
+                    }
+                }
+
+                // Step 3: legacy PROXY_IP fallback chain.
+                for target in proxy_ip.iter() {
+                    match process_tcp_outbound(
+                        &mut client_socket,
+                        target.as_str(),
+                        request.remote_port,
+                    )
+                    .await
                     {
                         Ok(_) => return Ok(()),
                         Err(e) if is_retryable(&e) => {
-                            last_error = Some(e);
+                            last_error = e;
                             continue;
                         }
                         Err(e) => return Err(e),
                     }
                 }
 
-                Err(last_error.unwrap_or_else(|| {
-                    Error::new(ErrorKind::ConnectionRefused, "no target to connect")
-                }))
+                Err(last_error)
             }
             protocol::NETWORK_TYPE_UDP => {
                 process_udp_outbound(&mut client_socket, request.remote_port).await
