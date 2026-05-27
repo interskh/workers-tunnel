@@ -693,8 +693,8 @@ mod proxy {
         #[test]
         fn parse_socks5_config_with_auth() {
             use super::parse_socks5_config;
-            let cfg = parse_socks5_config("bigkyle.com:41080", "myuser", "mypass").unwrap();
-            assert_eq!(cfg.host, "bigkyle.com");
+            let cfg = parse_socks5_config("socks.example.com:41080", "myuser", "mypass").unwrap();
+            assert_eq!(cfg.host, "socks.example.com");
             assert_eq!(cfg.port, 41080);
             assert_eq!(cfg.user.as_deref(), Some("myuser"));
             assert_eq!(cfg.pass.as_deref(), Some("mypass"));
