@@ -1,4 +1,4 @@
-use crate::proxy::{parse_early_data, parse_user_id, run_tunnel};
+use crate::proxy::{parse_early_data, parse_socks5_config, parse_user_id, run_tunnel};
 use crate::websocket::WebSocketStream;
 use worker::*;
 
@@ -44,6 +44,27 @@ async fn main(req: Request, env: Env, _: Context) -> Result<Response> {
         .map(String::from)
         .collect();
 
+    let socks5_addr = env
+        .var("SOCKS5_ADDR")
+        .map(|v| v.to_string())
+        .unwrap_or_default();
+    let socks5_user = env
+        .var("SOCKS5_USER")
+        .map(|v| v.to_string())
+        .unwrap_or_default();
+    let socks5_pass = env
+        .var("SOCKS5_PASS")
+        .map(|v| v.to_string())
+        .unwrap_or_default();
+    let socks5_domains: Vec<String> = env
+        .var("SOCKS5_DOMAINS")
+        .map(|v| v.to_string())
+        .unwrap_or_default()
+        .split_ascii_whitespace()
+        .map(String::from)
+        .collect();
+    let socks5 = parse_socks5_config(&socks5_addr, &socks5_user, &socks5_pass);
+
     let early_data = req.headers().get("sec-websocket-protocol")?;
     let early_data = parse_early_data(early_data)?;
 
@@ -62,7 +83,9 @@ async fn main(req: Request, env: Env, _: Context) -> Result<Response> {
 
         let socket = WebSocketStream::new(&server, events, early_data);
 
-        if let Err(err) = run_tunnel(socket, user_id, &proxy_ip).await {
+        if let Err(err) =
+            run_tunnel(socket, user_id, &proxy_ip, socks5.as_ref(), &socks5_domains).await
+        {
             console_error!("error: {}", err);
             _ = server.close(Some(1003), Some("invalid request"));
         }
@@ -106,6 +129,57 @@ mod proxy {
             err.kind(),
             ErrorKind::ConnectionRefused | ErrorKind::TimedOut | ErrorKind::ConnectionAborted
         )
+    }
+
+    pub struct Socks5Config {
+        pub host: String,
+        pub port: u16,
+        pub user: Option<String>,
+        pub pass: Option<String>,
+    }
+
+    pub fn parse_socks5_config(addr: &str, user: &str, pass: &str) -> Option<Socks5Config> {
+        if addr.is_empty() {
+            return None;
+        }
+        let (host, port_str) = addr.rsplit_once(':')?;
+        let port: u16 = port_str.parse().ok()?;
+        let (user_opt, pass_opt) = if user.is_empty() {
+            (None, None)
+        } else {
+            (Some(user.to_string()), Some(pass.to_string()))
+        };
+        Some(Socks5Config {
+            host: host.to_string(),
+            port,
+            user: user_opt,
+            pass: pass_opt,
+        })
+    }
+
+    fn matches_socks5_whitelist(target: &str, patterns: &[String]) -> bool {
+        patterns.iter().any(|pattern| {
+            target == pattern.as_str() || target.ends_with(&format!(".{}", pattern))
+        })
+    }
+
+    fn build_socks5_auth_request(user: &str, pass: &str) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(3 + user.len() + pass.len());
+        buf.push(0x01);
+        buf.push(user.len() as u8);
+        buf.extend_from_slice(user.as_bytes());
+        buf.push(pass.len() as u8);
+        buf.extend_from_slice(pass.as_bytes());
+        buf
+    }
+
+    fn build_socks5_connect_request(target: &str, port: u16) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(7 + target.len());
+        buf.extend_from_slice(&[0x05, 0x01, 0x00, 0x03]);
+        buf.push(target.len() as u8);
+        buf.extend_from_slice(target.as_bytes());
+        buf.extend_from_slice(&port.to_be_bytes());
+        buf
     }
 
     struct TunnelRequest {
@@ -154,6 +228,8 @@ mod proxy {
         mut client_socket: WebSocketStream<'_>,
         user_id: [u8; 16],
         proxy_ip: &[String],
+        socks5: Option<&Socks5Config>,
+        socks5_domains: &[String],
     ) -> Result<()> {
         let request = tokio::select! {
             result = read_tunnel_request(&mut client_socket, &user_id) => result?,
@@ -168,6 +244,18 @@ mod proxy {
         // process outbound
         match request.network_type {
             protocol::NETWORK_TYPE_TCP => {
+                if let Some(cfg) = socks5 {
+                    if matches_socks5_whitelist(&request.remote_addr, socks5_domains) {
+                        return process_socks5_outbound(
+                            &mut client_socket,
+                            cfg,
+                            &request.remote_addr,
+                            request.remote_port,
+                        )
+                        .await;
+                    }
+                }
+
                 let mut last_error = None;
 
                 for target in std::iter::once(request.remote_addr.as_str())
@@ -257,7 +345,23 @@ mod proxy {
         target: &str,
         port: u16,
     ) -> Result<()> {
-        let mut remote_socket = Socket::builder().connect(target, port).map_err(|e| {
+        let mut remote_socket = open_direct_socket(target, port).await?;
+        relay_to_remote(client_socket, &mut remote_socket, target, port).await
+    }
+
+    async fn process_socks5_outbound(
+        client_socket: &mut WebSocketStream<'_>,
+        cfg: &Socks5Config,
+        target: &str,
+        target_port: u16,
+    ) -> Result<()> {
+        let mut remote_socket = open_direct_socket(cfg.host.as_str(), cfg.port).await?;
+        socks5_handshake(&mut remote_socket, cfg, target, target_port).await?;
+        relay_to_remote(client_socket, &mut remote_socket, target, target_port).await
+    }
+
+    async fn open_direct_socket(host: &str, port: u16) -> Result<Socket> {
+        let remote_socket = Socket::builder().connect(host, port).map_err(|e| {
             Error::new(
                 ErrorKind::ConnectionRefused,
                 format!("connect to remote failed: {}", e),
@@ -265,14 +369,106 @@ mod proxy {
         })?;
 
         tokio::select! {
-            result = remote_socket.opened() => { result.map_err(|e| {
-                Error::new(ErrorKind::ConnectionRefused, format!("remote socket not opened: {}", e))
-            })?; }
+            result = remote_socket.opened() => {
+                result.map_err(|e| {
+                    Error::new(
+                        ErrorKind::ConnectionRefused,
+                        format!("remote socket not opened: {}", e),
+                    )
+                })?;
+            }
             _ = Delay::from(CONNECT_TIMEOUT) => {
                 return Err(Error::new(ErrorKind::TimedOut, "connect to remote timed out"));
             }
         }
 
+        Ok(remote_socket)
+    }
+
+    async fn socks5_handshake(
+        socket: &mut Socket,
+        cfg: &Socks5Config,
+        target: &str,
+        target_port: u16,
+    ) -> Result<()> {
+        let auth_method: u8 = if cfg.user.is_some() { 0x02 } else { 0x00 };
+
+        socket.write_all(&[0x05, 0x01, auth_method]).await?;
+
+        let mut resp = [0u8; 2];
+        socket.read_exact(&mut resp).await?;
+        if resp[0] != 0x05 {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                format!("socks5: bad version 0x{:02x}", resp[0]),
+            ));
+        }
+        if resp[1] != auth_method {
+            return Err(Error::new(
+                ErrorKind::PermissionDenied,
+                format!("socks5: server rejected method 0x{:02x}", auth_method),
+            ));
+        }
+
+        if auth_method == 0x02 {
+            let user = cfg.user.as_deref().unwrap_or_default();
+            let pass = cfg.pass.as_deref().unwrap_or_default();
+            let auth_req = build_socks5_auth_request(user, pass);
+            socket.write_all(&auth_req).await?;
+
+            let mut auth_resp = [0u8; 2];
+            socket.read_exact(&mut auth_resp).await?;
+            if auth_resp[1] != 0x00 {
+                return Err(Error::new(
+                    ErrorKind::PermissionDenied,
+                    format!("socks5: auth failed status=0x{:02x}", auth_resp[1]),
+                ));
+            }
+        }
+
+        let connect_req = build_socks5_connect_request(target, target_port);
+        socket.write_all(&connect_req).await?;
+
+        let mut head = [0u8; 4];
+        socket.read_exact(&mut head).await?;
+        if head[0] != 0x05 || head[1] != 0x00 {
+            return Err(Error::new(
+                ErrorKind::ConnectionRefused,
+                format!("socks5: CONNECT failed rep=0x{:02x}", head[1]),
+            ));
+        }
+
+        match head[3] {
+            0x01 => {
+                let mut buf = [0u8; 4 + 2];
+                socket.read_exact(&mut buf).await?;
+            }
+            0x03 => {
+                let len = socket.read_u8().await? as usize;
+                let mut buf = vec![0u8; len + 2];
+                socket.read_exact(&mut buf).await?;
+            }
+            0x04 => {
+                let mut buf = [0u8; 16 + 2];
+                socket.read_exact(&mut buf).await?;
+            }
+            atyp => {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    format!("socks5: bad ATYP 0x{:02x}", atyp),
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn relay_to_remote(
+        client_socket: &mut WebSocketStream<'_>,
+        remote_socket: &mut Socket,
+        target: &str,
+        port: u16,
+    ) -> Result<()> {
         client_socket
             .write_all(&protocol::RESPONSE)
             .await
@@ -285,7 +481,7 @@ mod proxy {
         client_socket.flush().await?;
 
         let (mut cr, mut cw) = tokio::io::split(client_socket);
-        let (mut rr, mut rw) = tokio::io::split(&mut remote_socket);
+        let (mut rr, mut rw) = tokio::io::split(remote_socket);
 
         let c2r = async {
             let mut buf = vec![0u8; COPY_BUF_SIZE];
@@ -449,6 +645,94 @@ mod proxy {
         #[test]
         fn does_not_retry_broken_pipe() {
             assert!(!is_retryable(&Error::new(ErrorKind::BrokenPipe, "")));
+        }
+
+        #[test]
+        fn parse_socks5_config_empty_addr_returns_none() {
+            use super::parse_socks5_config;
+            assert!(parse_socks5_config("", "u", "p").is_none());
+        }
+
+        #[test]
+        fn parse_socks5_config_with_auth() {
+            use super::parse_socks5_config;
+            let cfg = parse_socks5_config("bigkyle.com:41080", "myuser", "mypass").unwrap();
+            assert_eq!(cfg.host, "bigkyle.com");
+            assert_eq!(cfg.port, 41080);
+            assert_eq!(cfg.user.as_deref(), Some("myuser"));
+            assert_eq!(cfg.pass.as_deref(), Some("mypass"));
+        }
+
+        #[test]
+        fn parse_socks5_config_without_auth() {
+            use super::parse_socks5_config;
+            let cfg = parse_socks5_config("host:1080", "", "").unwrap();
+            assert!(cfg.user.is_none());
+            assert!(cfg.pass.is_none());
+        }
+
+        #[test]
+        fn parse_socks5_config_rejects_malformed_addr() {
+            use super::parse_socks5_config;
+            assert!(parse_socks5_config("no-port", "", "").is_none());
+            assert!(parse_socks5_config("host:not-a-number", "", "").is_none());
+        }
+
+        #[test]
+        fn whitelist_matches_exact_domain() {
+            use super::matches_socks5_whitelist;
+            let patterns = vec!["openai.com".to_string()];
+            assert!(matches_socks5_whitelist("openai.com", &patterns));
+        }
+
+        #[test]
+        fn whitelist_matches_subdomain_via_suffix() {
+            use super::matches_socks5_whitelist;
+            let patterns = vec!["openai.com".to_string(), "anthropic.com".to_string()];
+            assert!(matches_socks5_whitelist("api.openai.com", &patterns));
+            assert!(matches_socks5_whitelist("claude.anthropic.com", &patterns));
+        }
+
+        #[test]
+        fn whitelist_rejects_partial_prefix_match() {
+            use super::matches_socks5_whitelist;
+            let patterns = vec!["openai.com".to_string()];
+            assert!(!matches_socks5_whitelist("badopenai.com", &patterns));
+            assert!(!matches_socks5_whitelist("openai.com.evil", &patterns));
+        }
+
+        #[test]
+        fn whitelist_empty_patterns_match_nothing() {
+            use super::matches_socks5_whitelist;
+            assert!(!matches_socks5_whitelist("anything.com", &[]));
+        }
+
+        #[test]
+        fn socks5_auth_request_byte_format() {
+            use super::build_socks5_auth_request;
+            let req = build_socks5_auth_request("user", "pass");
+            assert_eq!(
+                req,
+                vec![
+                    0x01,
+                    4, b'u', b's', b'e', b'r',
+                    4, b'p', b'a', b's', b's',
+                ]
+            );
+        }
+
+        #[test]
+        fn socks5_connect_request_byte_format() {
+            use super::build_socks5_connect_request;
+            let req = build_socks5_connect_request("openai.com", 443);
+            assert_eq!(
+                req,
+                vec![
+                    0x05, 0x01, 0x00, 0x03,
+                    10, b'o', b'p', b'e', b'n', b'a', b'i', b'.', b'c', b'o', b'm',
+                    0x01, 0xbb,
+                ]
+            );
         }
     }
 }

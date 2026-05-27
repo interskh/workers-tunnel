@@ -17,3 +17,9 @@ USER_ID = "00000000-0000-0000-0000-000000000000" # uuidgen | tr '[:upper:]' '[:l
 PROXY_IP = "" # space-separated relay endpoints; empty if only non-CF destinations
 FALLBACK_SITE = "" # served for non-WS probes, e.g. https://httpbin.org/status/404
 SHOW_URI = "true" # GET /{USER_ID} returns vless:// URI
+
+# SOCKS5 outbound for CF-blackholed destinations. Leave SOCKS5_ADDR empty to disable.
+SOCKS5_ADDR = "" # host:port of your SOCKS5 server (e.g. relay.example.com:41080)
+SOCKS5_USER = "" # SOCKS5 username (empty disables auth)
+SOCKS5_PASS = "" # SOCKS5 password
+SOCKS5_DOMAINS = "" # space-separated domain suffixes routed via SOCKS5 (e.g. openai.com claude.ai)
