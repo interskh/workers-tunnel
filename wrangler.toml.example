@@ -23,3 +23,15 @@ SOCKS5_ADDR = "" # host:port of your SOCKS5 server (e.g. relay.example.com:41080
 SOCKS5_USER = "" # SOCKS5 username (empty disables auth)
 SOCKS5_PASS = "" # SOCKS5 password
 SOCKS5_DOMAINS = "" # space-separated domain suffixes routed via SOCKS5 (e.g. openai.com claude.ai)
+
+# Optional: serve a Clash/FlClash subscription YAML from KV[CONFIG]/flclash.
+# GET /sub?token=<SUB_TOKEN>. Leave SUB_TOKEN empty to disable (returns 403).
+# Keep this secret distinct from USER_ID so URL leaks don't compromise VLESS.
+SUB_TOKEN = "" # openssl rand -hex 32
+
+# KV namespace for the subscription YAML. Opt-in: uncomment after running
+#   npx wrangler kv namespace create CONFIG
+# and paste the returned id. Then `bash publish-flclash.sh` to seed.
+# [[kv_namespaces]]
+# binding = "CONFIG"
+# id = "<paste from wrangler kv namespace create>"

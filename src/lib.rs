@@ -13,6 +13,36 @@ async fn main(req: Request, env: Env, _: Context) -> Result<Response> {
         .unwrap_or(false);
 
     if !is_websocket {
+        // Token-gated FlClash subscription endpoint: serves YAML from KV.
+        // Kept token separate from USER_ID so URL leaks don't compromise VLESS.
+        if req.path() == "/sub" {
+            let expected = env
+                .var("SUB_TOKEN")
+                .map(|v| v.to_string())
+                .unwrap_or_default();
+            let url = req.url()?;
+            let provided = url
+                .query_pairs()
+                .find(|(k, _)| k.as_ref() == "token")
+                .map(|(_, v)| v.into_owned())
+                .unwrap_or_default();
+            if expected.is_empty() || provided != expected {
+                return Response::error("Forbidden", 403);
+            }
+            let yaml = env
+                .kv("CONFIG")?
+                .get("flclash")
+                .text()
+                .await?
+                .unwrap_or_default();
+            if yaml.is_empty() {
+                return Response::error("Config not in KV — run publish.sh", 404);
+            }
+            let headers = Headers::new();
+            headers.set("Content-Type", "text/yaml; charset=utf-8")?;
+            return Ok(Response::ok(yaml)?.with_headers(headers));
+        }
+
         let show_uri: bool = env.var("SHOW_URI")?.to_string().parse().unwrap_or(false);
         if show_uri && req.path().contains(uuid_str.as_str()) {
             let host_str = req.url()?.host_str().unwrap_or_default().to_string();
