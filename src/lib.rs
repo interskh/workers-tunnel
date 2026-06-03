@@ -1294,10 +1294,12 @@ mod singmux {
     const FLAG_UDP: u16 = 0x0001;
     const FLAG_PACKET_ADDR: u16 = 0x0002;
 
-    // sing-mux address types
+    // sing-mux stream-request address types follow sing-box's SocksaddrSerializer,
+    // which uses SOCKS5 (RFC 1928) ATYP values — NOT VLESS's 1/2/3 scheme.
+    // Verified against captured mihomo bytes: "example.com" → atype 0x03.
     const ATYP_IPV4: u8 = 1;
-    const ATYP_FQDN: u8 = 2;
-    const ATYP_IPV6: u8 = 3;
+    const ATYP_FQDN: u8 = 3;
+    const ATYP_IPV6: u8 = 4;
 
     const MAX_SUBSTREAMS: usize = 64;
     const OUTBOUND_CHUNK: usize = 8 * 1024;
@@ -1791,7 +1793,7 @@ mod singmux {
 
         #[tokio::test]
         async fn parses_stream_request_with_fqdn() {
-            // flags=0(TCP), atype=2(FQDN), len=10, addr="google.com", port=443 BE
+            // flags=0(TCP), atype=3(FQDN, SOCKS5-style), len=10, "google.com", port=443 BE
             let mut bytes = vec![0u8, 0u8, ATYP_FQDN, 10];
             bytes.extend_from_slice(b"google.com");
             bytes.extend_from_slice(&443u16.to_be_bytes());
@@ -1803,6 +1805,28 @@ mod singmux {
         }
 
         #[tokio::test]
+        async fn parses_real_mihomo_stream_request() {
+            // Ground-truth bytes captured from mihomo 1.19.26 smux client:
+            // flags=0, atype=0x03 (FQDN), len=0x0b, "example.com", port=0x0050 (80),
+            // followed by the start of the HTTP payload (must be left for the relay).
+            let req: &[u8] = &[
+                0x00, 0x00, 0x03, 0x0b, b'e', b'x', b'a', b'm', b'p', b'l', b'e', b'.',
+                b'c', b'o', b'm', 0x00, 0x50,
+            ];
+            let mut payload = req.to_vec();
+            payload.extend_from_slice(b"GET / HTTP/1.1\r\n");
+            let mut cursor = std::io::Cursor::new(payload);
+            let (flags, addr, port) = read_stream_request(&mut cursor).await.unwrap();
+            assert_eq!(flags, 0);
+            assert_eq!(addr, "example.com");
+            assert_eq!(port, 80);
+            // Remaining bytes (the HTTP payload) must still be readable for relay.
+            let mut rest = Vec::new();
+            cursor.read_to_end(&mut rest).await.unwrap();
+            assert_eq!(&rest, b"GET / HTTP/1.1\r\n");
+        }
+
+        #[tokio::test]
         async fn parses_stream_request_with_ipv4() {
             // flags=0, atype=1(IPv4), [1,2,3,4], port=80 BE
             let bytes = vec![0u8, 0u8, ATYP_IPV4, 1, 2, 3, 4, 0x00, 0x50];
@@ -1810,6 +1834,18 @@ mod singmux {
             let (_, addr, port) = read_stream_request(&mut cursor).await.unwrap();
             assert_eq!(addr, "1.2.3.4");
             assert_eq!(port, 80);
+        }
+
+        #[tokio::test]
+        async fn parses_stream_request_with_ipv6() {
+            // flags=0, atype=4(IPv6), 16 bytes (::1), port=443 BE
+            let mut bytes = vec![0u8, 0u8, ATYP_IPV6];
+            bytes.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+            bytes.extend_from_slice(&443u16.to_be_bytes());
+            let mut cursor = std::io::Cursor::new(bytes);
+            let (_, addr, port) = read_stream_request(&mut cursor).await.unwrap();
+            assert_eq!(addr, "[::1]");
+            assert_eq!(port, 443);
         }
 
         #[tokio::test]
